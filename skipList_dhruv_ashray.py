@@ -1,201 +1,224 @@
-import random
 import time
-import sys
+import random
+import os
+from pathlib import Path
 from tqdm import tqdm # type: ignore
+import sys
 
-class SkipNode:
-    def __init__(self, key, level, values):
-        self.key = key
-        self.values = values
-        self.forward = [None] * (level + 1)
+class SSTable:
+    def __init__(self, directory, id):
+        self.directory = directory
+        self.id = id
+        self.path = f"{directory}/ss_table_{id}.txt"
+        self.data = []
+        self.deletion_log = set()
 
-class SkipList:
-    def __init__(self, max_level=16, p=0.5):
-        self.max_level = max_level
-        self.p = p
-        self.header = self.create_node(self.max_level, None, None)
-        self.level = 0
-        self.space_taken = sys.getsizeof(self.header)
-        self.size = 0
+    def write_to_disk(self):
+        """Writes the data stored in the SSTable instance to a disk file."""
+        with open(self.path, 'w') as f:
+            for key, value in self.data:
+                if value is not None:
+                    f.write(f"{key},{value}\n")
+        self.data.clear()
 
-    def create_node(self, level, key=None, values=None):
-        return SkipNode(key, level, values)
+    def read_from_disk(self):
+        """Reads the data from the SSTable disk file and yields key-value pairs."""
+        with open(self.path, 'r') as f:
+            for line in f:
+                key, value = line.strip().split(',')
+                yield int(key), value
 
-    def random_level(self):
-        level = 0
-        while random.random() < self.p and level < self.max_level:
-            level += 1
-        return level
+    def delete(self):
+        """Deletes the SSTable file from the disk."""
+        os.remove(self.path)
 
-    def insert(self, key):
-        update = [None] * (self.max_level + 1)
-        current = self.header
+class LSMTree:
+    def __init__(self, memtable_limit=0, max_sstables=5):
+        self.memtable = {}
+        self.sstables = []
+        self.memtable_limit = memtable_limit
+        self.max_sstables = max_sstables
+        self.directory = Path("sstables")
+        self.directory.mkdir(exist_ok=True)
+        self.sstable_counter = 0
+        self.deletion_log = set()
+        self.search_results = {}
+        self.range_search_results = {}
 
-        for i in range(self.level, -1, -1):
-            while current.forward[i] and current.forward[i].key < key:
-                current = current.forward[i]
-            update[i] = current
+    def insert(self, key, value):
+        """Inserts a key-value pair into the LSMTree."""
+        if key in self.deletion_log:
+            self.deletion_log.remove(key)
+        self.memtable[key] = value
+        if len(self.memtable) >= self.memtable_limit:
+            self.flush_memtable()
 
-        current = current.forward[0]
-        if current and current.key == key:
-            return
+    def delete(self, key):
+        """Marks a key for deletion in the LSMTree."""
+        self.deletion_log.add(key)
+        if key in self.memtable:
+            del self.memtable[key]
 
-        rlevel = self.random_level()
-        if rlevel > self.level:
-            for i in range(self.level + 1, rlevel + 1):
-                update[i] = self.header
-            self.level = rlevel
+    def delete_range(self, start_key, end_key):
+        """Deletes a range of keys from the LSMTree."""
+        for key in tqdm(range(start_key, end_key + 1), desc="Deleting range"):
+            self.delete(key)
 
-        values = [random.randint(0, 100) for _ in range(3)]
-        new_node = self.create_node(rlevel, key, values)
-        for i in range(rlevel + 1):
-            new_node.forward[i] = update[i].forward[i]
-            update[i].forward[i] = new_node
+    def flush_memtable(self):
+        """Flushes the memtable to a new SSTable when the memtable limit is reached."""
+        sorted_memtable = sorted(self.memtable.items(), key=lambda x: x[0])
+        
+        new_sstable = SSTable(self.directory, self.sstable_counter)
+        new_sstable.data = [(k, v) for k, v in sorted_memtable if k not in self.deletion_log]
+        new_sstable.write_to_disk()
+        self.sstables.append(new_sstable)
+        self.memtable.clear()
+        self.sstable_counter += 1
+        self.compact_sstables()
 
-        self.size += 1
-        self.space_taken += sys.getsizeof(new_node) + sys.getsizeof(values)
+    def compact_sstables(self):
+        """Compacts SSTables when the maximum number of SSTables is exceeded."""
+        if len(self.sstables) > self.max_sstables:
+            merged_data = {}
+            for sstable in self.sstables:
+                for key, value in sstable.read_from_disk():
+                    if key not in self.deletion_log:
+                        merged_data[key] = value
+            for sstable in self.sstables:
+                sstable.delete()
+            self.sstables.clear()
+            self.deletion_log.clear()
+            sorted_items = sorted(merged_data.items())
+            chunks = [sorted_items[i:i + self.memtable_limit] for i in range(0, len(sorted_items), self.memtable_limit)]
+            for chunk in chunks:
+                new_sstable = SSTable(self.directory, self.sstable_counter)
+                new_sstable.data = chunk
+                new_sstable.write_to_disk()
+                self.sstables.append(new_sstable)
+                self.sstable_counter += 1
 
-    def delete(self, key: int) -> bool:
-        update = [None] * (self.max_level + 1)
-        current = self.header
-        deleted_space = 0
+    def enforce_final_compaction(self):
+        """Ensures that the final compaction is enforced if necessary."""
+        if len(self.sstables) > self.max_sstables:
+            self.compact_sstables()
 
-        for i in range(self.level, -1, -1):
-            while current.forward[i] and current.forward[i].key < key:
-                current = current.forward[i]
-            update[i] = current
+    def get_memtable_count(self):
+        """Returns the number of entries currently in the memtable."""
+        return len(self.memtable)
+    
+    def user_find_interface(self):
+        """Interface for finding multiple keys specified by the user."""
+        num_keys = int(input("Enter the number of keys to find: "))
+        keys = []
+        for _ in range(num_keys):
+            key = int(input("Enter a key to find: "))
+            keys.append(key)
 
-        current = current.forward[0]
-        if current and current.key == key:
-            for i in range(self.level + 1):
-                if update[i].forward[i] != current:
-                    break
-                update[i].forward[i] = current.forward[i]
+        start_time = time.time()
+        results = []
+        for key in keys:
+            result = self.find(key)
+            results.append(result)
+        elapsed_time = time.time() - start_time
+        print(f"Time taken to find all keys: {elapsed_time:.4f} seconds")
 
-            while self.level > 0 and self.header.forward[self.level] is None:
-                self.level -= 1
-
-            deleted_space += sys.getsizeof(current) + sys.getsizeof(current.values)
-            self.space_taken -= deleted_space
-            self.size -= 1
-            return True
-        else:
-            return False
-
-    def search(self, key):
-        current = self.header
-        for i in range(self.level, 1, -1):
-            while current.forward[i] and current.forward[i].key < key:
-                current = current.forward[i]
-
-        current = current.forward[0]
-        if current and current.key == key:
-            return current.values
-
+    def search_sstable(self, sstable, key):
+        """Searches for a key in a specific SSTable."""
+        try:
+            with open(sstable.path, 'r') as file:
+                for line in file:
+                    k, v = line.strip().split(',')
+                    k = int(k)
+                    if k == key:
+                        print(f"Found key {key} in SSTable {sstable.id}")
+                        return v
+                    elif k > key:
+                        break
+        except Exception as e:
+            print(f"Error reading SSTable: {e}")
         return None
 
-    def display_list(self):
-        # print("Skip List Levels: ", self.level)
-        for lvl in range(self.level + 1):
-            node = self.header.forward[lvl]
-            line = ""
-            while node:
-                line += f"Key: {node.key}, Values: {node.values} "
-                node = node.forward[lvl]
-            # print("Level " + str(lvl) + ": " + line)
+    def find(self, key):
+        """Finds the value associated with a key in the LSMTree."""
+        if key in self.memtable:
+            self.search_results[key] = self.memtable[key]
+            print(f"Found key {key} in memory")
+            return self.memtable[key]
+        for sstable in reversed(self.sstables):
+            result = self.search_sstable(sstable, key)
+            if result is not None:
+                self.search_results[key] = result
+                return result
+        print(f"Key {key} not found")
+        return "Key not found"
 
-    def free(self):
-        print("Space taken: ", self.space_taken, " bytes")
-        self.header = self.create_node(self.max_level, None, None)
-        self.level = 0
-        self.space_taken = sys.getsizeof(self.header)
-        self.size = 0
-
-    def range_query(self, low, high):
-        result = []
-        current = self.header
-        for i in range(self.level, -1, -1):
-            while current.forward[i] and current.forward[i].key < low:
-                current = current.forward[i]
-
-        current = current.forward[0]
-        while current and low <= current.key <= high:
-            result.append((current.key, current.values))
-            current = current.forward[0]
-        size = sys.getsizeof(result)
-        print('The space for range query' , size ,"bytes")
-        return result
+    def range_query(self, start_key, end_key):
+        """Performs a range query on the LSMTree and returns all key-value pairs within the specified range."""
+        start_time = time.time() 
+        results = {}
+        for key, value in self.memtable.items():
+            if start_key <= key <= end_key:
+                results[key] = value
+        for sstable in self.sstables:
+            for key, value in sstable.read_from_disk():
+                if start_key <= key <= end_key and key not in results:
+                    results[key] = value
+        end_time = time.time()
+        time_taken = end_time - start_time
+        print(f"Time taken for range query: {time_taken:.4f} seconds")
+        return sorted(results.items())
     
-skip_list = SkipList()
+    def print_memory_usage(self):
+        """Prints the memory usage of the search results."""
+        size = sys.getsizeof(self.search_results)
+        print(f"Space used by search results: {size} bytes")
 
-num_values_to_insert = int(input("Enter the number of random values to insert: "))
-insertion_space = 0
-start_time = time.time()
-with tqdm(total=num_values_to_insert) as pbar:
-    for _ in range(num_values_to_insert):
-        random_key = random.randint(0, 5000) #change
-        #random_key = random.randint(0, 500)
-        skip_list.insert(random_key)
-        pbar.update(1)
-end_time = time.time()
-skip_list.display_list()
-print()
-print("Time taken to insert", num_values_to_insert, "random values: ", end_time - start_time, "seconds")
-print("Total space taken after insertions: ", skip_list.space_taken, "bytes")
-# print("Total size of the skip list: ", skip_list.size)
-print()
+def main():
+    lsm_tree = LSMTree(memtable_limit=300000, max_sstables=10)
+    
+    # Insertion of random keys
+    start_time = time.time()
+    random_keys = random.sample(range(10000000), 10000000)  # Generate a list of unique random keys
+    for key in tqdm(random_keys, desc="Inserting keys"):
+        lsm_tree.insert(key, f"value{key}")
+    print(f"Time taken for insertion: {time.time() - start_time:.4f} seconds")
 
+    # Calculate total space used after insertion
+    current_directory = os.getcwd()
+    total_size = sum(os.path.getsize(os.path.join(dirpath, f)) for dirpath, _, filenames in os.walk(current_directory) for f in filenames)
+    initial_size = total_size
 
-print()
-num_values_to_delete = int(input("Enter the number of random values to delete: "))
+    print(f"Total space used after insertion: {total_size} bytes")
 
-deleted_values = []
-deleted_space = 0
-start_time = time.time()
-with tqdm(total=num_values_to_delete) as pbar:
-    for _ in range(num_values_to_delete):
-        key_to_delete = random.randint(0, 1000) #change
-        if skip_list.delete(key_to_delete):
-            deleted_values.append(key_to_delete)
-  # Assuming key size is representative of node size
-        pbar.update(1)
-end_time = time.time()
-print("Deleted values: ", deleted_values)
-print("Time taken to delete multiple values: ", end_time - start_time, "seconds")
-# print("Total size of the skip list after deletion: ", skip_list.size)
-print("Space taken after deletion: ", skip_list.space_taken, "bytes")
+    # Deleting a range of keys
+    start_time = time.time()
+    lsm_tree.delete_range(1, 20)
+    print(f"Time taken for range deletion: {time.time() - start_time:.4f} seconds")
+    lsm_tree.enforce_final_compaction()
 
+    # Calculate total space used after deletion
+    total_size = sum(os.path.getsize(os.path.join(dirpath, f)) for dirpath, _, filenames in os.walk(current_directory) for f in filenames)
+    print(f"Total space freed by deletion: {initial_size - total_size} bytes")
 
-num_values_to_search = int(input("Enter the number of random values to search: "))
-start_time = time.time()
-results=[]
-with tqdm(total=num_values_to_search) as pbar:
-    for _ in range(num_values_to_search):
-        search_value = random.randint(0, 1500) #change
-        search_result = skip_list.search(search_value)
-        if search_result:
-            results.append(search_value)
-            print(f"Value {search_value} Found with values: {search_result}")
-        else:
-            print(f"Value {search_value} NOT FOUND")
-        pbar.update(1)
-end_time = time.time()
-print("Time taken to search for multiple values: ", end_time - start_time, "seconds")
-size = sys.getsizeof(results)
-print('The space for Search' , size ,"bytes")
+    # Finding keys specified by the user
+    lsm_tree.user_find_interface()
+    lsm_tree.print_memory_usage()
 
-print()
+    # Performing a range query
+    start_key = 2000
+    end_key = 50000
+    results = lsm_tree.range_query(start_key, end_key)
+    range_query_size = sys.getsizeof(results)
+    print(f"Space used by range query results: {range_query_size} bytes")
+    print("Range Query Results:")
+    
+    input('Press Enter to display range query results')
+    for key, value in results:
+        print(f"Key: {key}, Value: {value}")
 
-range_low = int(input("Enter the lower limit of the range query: "))
-range_high = int(input("Enter the upper limit of the range query: "))
-start_time = time.time()
-range_result = skip_list.range_query(range_low, range_high)
-# print(f"Values between {range_low} and {range_high}: {range_result}")
-print()
-end_time = time.time()
-print("Time taken for range query: ", end_time - start_time, "seconds")
+    # Displaying the number of entries in the memtable
+    memtable_count = lsm_tree.get_memtable_count()
+    print(f"Current number of entries in MemTable: {memtable_count}")
 
-
-
-skip_list.free()
-print("Skip List Freed")
+if __name__ == "__main__":
+    main()
